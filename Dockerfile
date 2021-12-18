@@ -47,16 +47,14 @@ ENV HTTPS_ONLY=$use_https
 ARG whoogle_port=5000
 ENV EXPOSE_PORT=$whoogle_port
 
-ARG twitter_alt='farside.link/nitter'
+ARG twitter_alt='nitter.net'
 ENV WHOOGLE_ALT_TW=$twitter_alt
-ARG youtube_alt='farside.link/invidious'
+ARG youtube_alt='invidious.snopyta.org'
 ENV WHOOGLE_ALT_YT=$youtube_alt
-ARG instagram_alt='farside.link/bibliogram'
+ARG instagram_alt='bibliogram.art/u'
 ENV WHOOGLE_ALT_IG=$instagram_alt
-ARG reddit_alt='farside.link/libreddit'
+ARG reddit_alt='libredd.it'
 ENV WHOOGLE_ALT_RD=$reddit_alt
-ARG medium_alt='farside.link/scribe'
-ENV WHOOGLE_ALT_MD=$medium_alt
 ARG translate_alt='lingva.ml'
 ENV WHOOGLE_ALT_TL=$translate_alt
 
@@ -67,7 +65,7 @@ COPY misc/tor/torrc /etc/tor/torrc
 COPY misc/tor/start-tor.sh misc/tor/start-tor.sh
 COPY app/ app/
 COPY run .
-#COPY whoogle.env .
+COPY whoogle.env .
 
 # Allow writing symlinks to build dir
 RUN chown 102:102 app/static/build
