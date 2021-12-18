@@ -5,37 +5,22 @@ import json
 import pickle
 import urllib.parse as urlparse
 import uuid
-from datetime import timedelta
 from functools import wraps
 
 import waitress
-from app import app
-from app.models.config import Config
-from app.models.endpoint import Endpoint
-from app.request import Request, TorError
-from app.utils.bangs import resolve_bang
-from app.utils.misc import read_config_bool, get_client_ip, get_request_url
-from app.utils.results import add_ip_card, bold_search_terms,\
-    add_currency_card, check_currency
-from app.utils.search import *
-from app.utils.session import generate_user_key, valid_user_session
-from bs4 import BeautifulSoup as bsoup
 from flask import jsonify, make_response, request, redirect, render_template, \
     send_file, session, url_for
-from requests import exceptions, get
-from requests.models import PreparedRequest
+from requests import exceptions
+
+from app import app
+from app.models.config import Config
+from app.request import Request, TorError
+from app.utils.bangs import resolve_bang
+from app.utils.session import generate_user_key, valid_user_session
+from app.utils.search import *
 
 # Load DDG bang json files only on init
 bang_json = json.load(open(app.config['BANG_FILE']))
-
-# Check the newest version of WHOOGLE
-update = bsoup(get(app.config['RELEASES_URL']).text, 'html.parser')
-newest_version = update.select_one('[class="Link--primary"]').string[1:]
-current_version = int(''.join(filter(str.isdigit,
-                                     app.config['VERSION_NUMBER'])))
-newest_version = int(''.join(filter(str.isdigit, newest_version)))
-newest_version = '' if current_version >= newest_version \
-    else newest_version
 
 
 def auth_required(f):
@@ -58,86 +43,40 @@ def auth_required(f):
     return decorated
 
 
-def session_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if (valid_user_session(session) and
-                'cookies_disabled' not in request.args):
-            g.session_key = session['key']
-        else:
-            session.pop('_permanent', None)
-            g.session_key = app.default_key
-
-        # Clear out old sessions
-        invalid_sessions = []
-        for user_session in os.listdir(app.config['SESSION_FILE_DIR']):
-            session_path = os.path.join(
-                app.config['SESSION_FILE_DIR'],
-                user_session)
-            try:
-                with open(session_path, 'rb') as session_file:
-                    _ = pickle.load(session_file)
-                    data = pickle.load(session_file)
-                    if isinstance(data, dict) and 'valid' in data:
-                        continue
-                    invalid_sessions.append(session_path)
-            except (EOFError, FileNotFoundError):
-                pass
-
-        for invalid_session in invalid_sessions:
-            os.remove(invalid_session)
-
-        return f(*args, **kwargs)
-
-    return decorated
-
-
 @app.before_request
 def before_request_func():
     g.request_params = (
         request.args if request.method == 'GET' else request.form
     )
-
-    # Skip pre-request actions if verifying session
-    if '/session' in request.path and not valid_user_session(session):
-        return
-
-    default_config = json.load(open(app.config['DEFAULT_CONFIG'])) \
-        if os.path.exists(app.config['DEFAULT_CONFIG']) else {}
+    g.cookies_disabled = False
 
     # Generate session values for user if unavailable
-    if (not valid_user_session(session) and
-            'cookies_disabled' not in request.args):
-        session['config'] = default_config
+    if not valid_user_session(session):
+        session['config'] = json.load(open(app.config['DEFAULT_CONFIG'])) \
+            if os.path.exists(app.config['DEFAULT_CONFIG']) else {}
         session['uuid'] = str(uuid.uuid4())
-        session['key'] = generate_user_key()
+        session['key'] = generate_user_key(True)
 
-        # Skip checking for session on any searches that don't
-        # require a valid session
-        if (not Endpoint.autocomplete.in_path(request.path) and
-                not Endpoint.healthz.in_path(request.path)):
-            return redirect(url_for(
-                'session_check',
-                session_id=session['uuid'],
-                follow=get_request_url(request.url)), code=307)
-        else:
-            g.user_config = Config(**session['config'])
-    elif 'cookies_disabled' not in request.args:
-        # Set session as permanent
-        session.permanent = True
-        app.permanent_session_lifetime = timedelta(days=365)
-        g.user_config = Config(**session['config'])
-    else:
-        # User has cookies disabled, fall back to immutable default config
-        session.pop('_permanent', None)
-        g.user_config = Config(**default_config)
+        # Flag cookies as possibly disabled in order to prevent against
+        # unnecessary session directory expansion
+        g.cookies_disabled = True
+
+    # Handle https upgrade
+    if needs_https(request.url):
+        return redirect(
+            request.url.replace('http://', 'https://', 1),
+            code=308)
+
+    g.user_config = Config(**session['config'])
 
     if not g.user_config.url:
-        g.user_config.url = get_request_url(request.url_root)
+        g.user_config.url = request.url_root.replace(
+            'http://',
+            'https://') if os.getenv('HTTPS_ONLY', False) else request.url_root
 
     g.user_request = Request(
         request.headers.get('User-Agent'),
-        get_request_url(request.url_root),
+        request.url_root,
         config=g.user_config)
 
     g.app_location = g.user_config.url
@@ -145,14 +84,22 @@ def before_request_func():
 
 @app.after_request
 def after_request_func(resp):
-    resp.headers['X-Content-Type-Options'] = 'nosniff'
-    resp.headers['X-Frame-Options'] = 'DENY'
+    # Check if address consistently has cookies blocked,
+    # in which case start removing session files after creation.
+    #
+    # Note: This is primarily done to prevent overpopulation of session
+    # directories, since browsers that block cookies will still trigger
+    # Flask's session creation routine with every request.
+    if g.cookies_disabled and request.remote_addr not in app.no_cookie_ips:
+        app.no_cookie_ips.append(request.remote_addr)
+    elif g.cookies_disabled and request.remote_addr in app.no_cookie_ips:
+        session_list = list(session.keys())
+        for key in session_list:
+            session.pop(key)
 
-    if os.getenv('WHOOGLE_CSP', False):
-        resp.headers['Content-Security-Policy'] = app.config['CSP']
-        if os.environ.get('HTTPS_ONLY', False):
-            resp.headers['Content-Security-Policy'] += \
-                'upgrade-insecure-requests'
+    resp.headers['Content-Security-Policy'] = app.config['CSP']
+    if os.environ.get('HTTPS_ONLY', False):
+        resp.headers['Content-Security-Policy'] += 'upgrade-insecure-requests'
 
     return resp
 
@@ -163,28 +110,17 @@ def unknown_page(e):
     return redirect(g.app_location)
 
 
-@app.route(f'/{Endpoint.healthz}', methods=['GET'])
+@app.route('/healthz', methods=['GET'])
 def healthz():
     return ''
 
 
-@app.route(f'/{Endpoint.session}/<session_id>', methods=['GET', 'PUT', 'POST'])
-def session_check(session_id):
-    if 'uuid' in session and session['uuid'] == session_id:
-        session['valid'] = True
-        return redirect(request.args.get('follow'), code=307)
-    else:
-        follow_url = request.args.get('follow')
-        req = PreparedRequest()
-        req.prepare_url(follow_url, {'cookies_disabled': 1})
-        session.pop('_permanent', None)
-        return redirect(req.url, code=307)
-
-
 @app.route('/', methods=['GET'])
-@app.route(f'/{Endpoint.home}', methods=['GET'])
 @auth_required
 def index():
+    # Reset keys
+    session['key'] = generate_user_key(g.cookies_disabled)
+
     # Redirect if an error was raised
     if 'error_message' in session and session['error_message']:
         error_message = session['error_message']
@@ -192,7 +128,6 @@ def index():
         return render_template('error.html', error_message=error_message)
 
     return render_template('index.html',
-                           newest_version=newest_version,
                            languages=app.config['LANGUAGES'],
                            countries=app.config['COUNTRIES'],
                            themes=app.config['THEMES'],
@@ -202,16 +137,13 @@ def index():
                            logo=render_template(
                                'logo.html',
                                dark=g.user_config.dark),
-                           config_disabled=(
-                                   app.config['CONFIG_DISABLE'] or
-                                   not valid_user_session(session) or
-                                   'cookies_disabled' in request.args),
+                           config_disabled=app.config['CONFIG_DISABLE'],
                            config=g.user_config,
                            tor_available=int(os.environ.get('TOR_AVAILABLE')),
                            version_number=app.config['VERSION_NUMBER'])
 
 
-@app.route(f'/{Endpoint.opensearch}', methods=['GET'])
+@app.route('/opensearch.xml', methods=['GET'])
 def opensearch():
     opensearch_url = g.app_location
     if opensearch_url.endswith('/'):
@@ -231,7 +163,7 @@ def opensearch():
     ), 200, {'Content-Disposition': 'attachment; filename="opensearch.xml"'}
 
 
-@app.route(f'/{Endpoint.search_html}', methods=['GET'])
+@app.route('/search.html', methods=['GET'])
 def search_html():
     search_url = g.app_location
     if search_url.endswith('/'):
@@ -239,12 +171,8 @@ def search_html():
     return render_template('search.html', url=search_url)
 
 
-@app.route(f'/{Endpoint.autocomplete}', methods=['GET', 'POST'])
+@app.route('/autocomplete', methods=['GET', 'POST'])
 def autocomplete():
-    ac_var = 'WHOOGLE_AUTOCOMPLETE'
-    if os.getenv(ac_var) and not read_config_bool(ac_var):
-        return jsonify({})
-
     q = g.request_params.get('q')
     if not q:
         # FF will occasionally (incorrectly) send the q field without a
@@ -272,14 +200,14 @@ def autocomplete():
     ])
 
 
-@app.route(f'/{Endpoint.search}', methods=['GET', 'POST'])
-@session_required
+@app.route('/search', methods=['GET', 'POST'])
 @auth_required
 def search():
     # Update user config if specified in search args
     g.user_config = g.user_config.from_params(g.request_params)
 
-    search_util = Search(request, g.user_config, g.session_key)
+    search_util = Search(request, g.user_config, session,
+                         cookies_disabled=g.cookies_disabled)
     query = search_util.new_search_query()
 
     bang = resolve_bang(query=query, bangs_dict=bang_json)
@@ -288,7 +216,7 @@ def search():
 
     # Redirect to home if invalid/blank search
     if not query:
-        return redirect(url_for('.index'))
+        return redirect('/')
 
     # Generate response and number of external elements from the page
     try:
@@ -310,32 +238,10 @@ def search():
     translate_to = localization_lang.replace('lang_', '')
 
     # Return 503 if temporarily blocked by captcha
-    if has_captcha(str(response)):
-        return render_template(
-            'error.html',
-            blocked=True,
-            error_message=translation['ratelimit'],
-            translation=translation,
-            farside='https://farside.link',
-            config=g.user_config,
-            query=urlparse.unquote(query),
-            params=g.user_config.to_params()), 503
-    response = bold_search_terms(response, query)
-
-    # Feature to display IP address
-    if search_util.check_kw_ip():
-        html_soup = bsoup(str(response), 'html.parser')
-        response = add_ip_card(html_soup, get_client_ip(request))
-
-    # Feature to display currency_card
-    conversion = check_currency(str(response))
-    if conversion:
-        html_soup = bsoup(str(response), 'html.parser')
-        response = add_currency_card(html_soup, conversion)
+    resp_code = 503 if has_captcha(str(response)) else 200
 
     return render_template(
         'display.html',
-        newest_version=newest_version,
         query=urlparse.unquote(query),
         search_type=search_util.search_type,
         config=g.user_config,
@@ -359,17 +265,13 @@ def search():
             query=urlparse.unquote(query),
             search_type=search_util.search_type,
             mobile=g.user_request.mobile)
-                       if 'isch' not in
-                          search_util.search_type else '')), 200
+                if 'isch' not in search_util.search_type else '')), resp_code
 
 
-@app.route(f'/{Endpoint.config}', methods=['GET', 'POST', 'PUT'])
-@session_required
+@app.route('/config', methods=['GET', 'POST', 'PUT'])
 @auth_required
 def config():
-    config_disabled = (
-            app.config['CONFIG_DISABLE'] or
-            not valid_user_session(session))
+    config_disabled = app.config['CONFIG_DISABLE']
     if request.method == 'GET':
         return json.dumps(g.user_config.__dict__)
     elif request.method == 'PUT' and not config_disabled:
@@ -396,14 +298,18 @@ def config():
                     app.config['CONFIG_PATH'],
                     request.args.get('name')), 'wb'))
 
+        # Overwrite default config if user has cookies disabled
+        if g.cookies_disabled:
+            open(app.config['DEFAULT_CONFIG'], 'w').write(
+                json.dumps(config_data, indent=4))
+
         session['config'] = config_data
         return redirect(config_data['url'])
     else:
         return redirect(url_for('.index'), code=403)
 
 
-@app.route(f'/{Endpoint.url}', methods=['GET'])
-@session_required
+@app.route('/url', methods=['GET'])
 @auth_required
 def url():
     if 'url' in request.args:
@@ -418,18 +324,16 @@ def url():
             error_message='Unable to resolve query: ' + q)
 
 
-@app.route(f'/{Endpoint.imgres}')
-@session_required
+@app.route('/imgres')
 @auth_required
 def imgres():
     return redirect(request.args.get('imgurl'))
 
 
-@app.route(f'/{Endpoint.element}')
-@session_required
+@app.route('/element')
 @auth_required
 def element():
-    cipher_suite = Fernet(g.session_key)
+    cipher_suite = Fernet(session['key'])
     src_url = cipher_suite.decrypt(request.args.get('url').encode()).decode()
     src_type = request.args.get('type')
 
@@ -448,7 +352,7 @@ def element():
     return send_file(io.BytesIO(empty_gif), mimetype='image/gif')
 
 
-@app.route(f'/{Endpoint.window}')
+@app.route('/window')
 @auth_required
 def window():
     get_body = g.user_request.send(base_url=request.args.get('location')).text
@@ -462,13 +366,7 @@ def window():
     for script in results('script'):
         script.decompose()
 
-    return render_template(
-        'display.html',
-        response=results,
-        translation=app.config['TRANSLATIONS'][
-            g.user_config.get_localization_lang()
-        ]
-    )
+    return render_template('display.html', response=results)
 
 
 def run_app() -> None:
@@ -529,8 +427,7 @@ def run_app() -> None:
         os.environ['WHOOGLE_PROXY_TYPE'] = args.proxytype
         os.environ['WHOOGLE_PROXY_LOC'] = args.proxyloc
 
-    if args.https_only:
-        os.environ['HTTPS_ONLY'] = '1'
+    os.environ['HTTPS_ONLY'] = '1' if args.https_only else ''
 
     if args.debug:
         app.run(host=args.host, port=args.port, debug=args.debug)

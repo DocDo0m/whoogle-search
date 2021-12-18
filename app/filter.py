@@ -1,7 +1,4 @@
-from app.models.config import Config
-from app.models.endpoint import Endpoint
 from app.request import VALID_PARAMS, MAPS_URL
-from app.utils.misc import read_config_bool
 from app.utils.results import *
 from bs4 import BeautifulSoup
 from bs4.element import ResultSet, Tag
@@ -10,7 +7,6 @@ from flask import render_template
 import re
 import urllib.parse as urlparse
 from urllib.parse import parse_qs
-import os
 
 
 def extract_q(q_str: str, href: str) -> str:
@@ -46,8 +42,15 @@ class Filter:
     # type result (such as "people also asked", "related searches", etc)
     RESULT_CHILD_LIMIT = 7
 
-    def __init__(self, user_key: str, config: Config, mobile=False) -> None:
-        self.config = config
+    def __init__(self, user_key: str, mobile=False, config=None) -> None:
+        if config is None:
+            config = {}
+
+        self.near = config['near'] if 'near' in config else ''
+        self.dark = config['dark'] if 'dark' in config else False
+        self.nojs = config['nojs'] if 'nojs' in config else False
+        self.new_tab = config['new_tab'] if 'new_tab' in config else False
+        self.alt_redirect = config['alts'] if 'alts' in config else False
         self.mobile = mobile
         self.user_key = user_key
         self.main_divs = ResultSet('')
@@ -59,6 +62,16 @@ class Filter:
     @property
     def elements(self):
         return self._elements
+
+    def reskin(self, page: str) -> str:
+        # Aesthetic only re-skinning
+        if self.dark:
+            page = page.replace(
+                'fff', '000').replace(
+                '202124', 'ddd').replace(
+                '1967D2', '3b85ea')
+
+        return page
 
     def encrypt_path(self, path, is_element=False) -> str:
         # Encrypts path to avoid plaintext results in logs
@@ -74,8 +87,6 @@ class Filter:
     def clean(self, soup) -> BeautifulSoup:
         self.main_divs = soup.find('div', {'id': 'main'})
         self.remove_ads()
-        self.remove_block_titles()
-        self.remove_block_url()
         self.collapse_sections()
         self.update_styling(soup)
 
@@ -90,7 +101,7 @@ class Filter:
 
         input_form = soup.find('form')
         if input_form is not None:
-            input_form['method'] = 'GET' if self.config.get_only else 'POST'
+            input_form['method'] = 'POST'
 
         # Ensure no extra scripts passed through
         for script in soup('script'):
@@ -123,24 +134,6 @@ class Filter:
                        if has_ad_content(_.text)]
             _ = div.decompose() if len(div_ads) else None
 
-    def remove_block_titles(self) -> None:
-        if not self.main_divs or not self.config.block_title:
-            return
-        block_title = re.compile(self.block_title)
-        for div in [_ for _ in self.main_divs.find_all('div', recursive=True)]:
-            block_divs = [_ for _ in div.find_all('h3', recursive=True)
-                          if block_title.search(_.text) is not None]
-            _ = div.decompose() if len(block_divs) else None
-
-    def remove_block_url(self) -> None:
-        if not self.main_divs or not self.config.block_url:
-            return
-        block_url = re.compile(self.block_url)
-        for div in [_ for _ in self.main_divs.find_all('div', recursive=True)]:
-            block_divs = [_ for _ in div.find_all('a', recursive=True)
-                          if block_url.search(_.attrs['href']) is not None]
-            _ = div.decompose() if len(block_divs) else None
-
     def collapse_sections(self) -> None:
         """Collapses long result sections ("people also asked", "related
          searches", etc) into "details" elements
@@ -151,8 +144,6 @@ class Filter:
         Returns:
             None (The soup object is modified directly)
         """
-        minimal_mode = read_config_bool('WHOOGLE_MINIMAL')
-
         def pull_child_divs(result_div: BeautifulSoup):
             try:
                 return result_div.findChildren(
@@ -168,12 +159,8 @@ class Filter:
         # Loop through results and check for the number of child divs in each
         for result in self.main_divs:
             result_children = pull_child_divs(result)
-            if minimal_mode:
-                if len(result_children) in (1, 3):
-                    continue
-            else:
-                if len(result_children) < self.RESULT_CHILD_LIMIT:
-                    continue
+            if len(result_children) < self.RESULT_CHILD_LIMIT:
+                continue
 
             # Find and decompose the first element with an inner HTML text val.
             # This typically extracts the title of the section (i.e. "Related
@@ -192,18 +179,13 @@ class Filter:
             while not parent and idx < len(result_children):
                 parent = result_children[idx].parent
                 idx += 1
-
             details = BeautifulSoup(features='html.parser').new_tag('details')
             summary = BeautifulSoup(features='html.parser').new_tag('summary')
             summary.string = label
             details.append(summary)
 
-            if parent and not minimal_mode:
+            if parent:
                 parent.wrap(details)
-            elif parent and minimal_mode:
-                # Remove parent element from document if "minimal mode" is
-                # enabled
-                parent.decompose()
 
     def update_element_src(self, element: Tag, mime: str) -> None:
         """Encrypts the original src of an element and rewrites the element src
@@ -221,14 +203,14 @@ class Filter:
         if src.startswith(LOGO_URL):
             # Re-brand with Whoogle logo
             element.replace_with(BeautifulSoup(
-                render_template('logo.html'),
+                render_template('logo.html', dark=self.dark),
                 features='html.parser'))
             return
         elif src.startswith(GOOG_IMG) or GOOG_STATIC in src:
             element['src'] = BLANK_B64
             return
 
-        element['src'] = f'{Endpoint.element}?url=' + self.encrypt_path(
+        element['src'] = 'element?url=' + self.encrypt_path(
             src,
             is_element=True) + '&type=' + urlparse.quote(mime)
 
@@ -300,10 +282,10 @@ class Filter:
             link['href'] = filter_link_args(q)
 
             # Add no-js option
-            if self.config.nojs:
+            if self.nojs:
                 append_nojs(link)
 
-            if self.config.new_tab:
+            if self.new_tab:
                 link['target'] = '_blank'
         else:
             if href.startswith(MAPS_URL):
@@ -313,7 +295,7 @@ class Filter:
                 link['href'] = href
 
         # Replace link location if "alts" config is enabled
-        if self.config.alts:
+        if self.alt_redirect:
             # Search and replace all link descriptions
             # with alternative location
             link['href'] = get_site_alt(link['href'])
@@ -322,15 +304,8 @@ class Filter:
             if len(link_desc) == 0:
                 return
 
-            # Replace link description
-            link_desc = link_desc[0]
-            for site, alt in SITE_ALTS.items():
-                if site not in link_desc:
-                    continue
-                new_desc = BeautifulSoup(features='html.parser').new_tag('div')
-                new_desc.string = str(link_desc).replace(site, alt)
-                link_desc.replace_with(new_desc)
-                break
+            # Replace link destination
+            link_desc[0].replace_with(get_site_alt(link_desc[0]))
 
     def view_image(self, soup) -> BeautifulSoup:
         """Replaces the soup with a new one that handles mobile results and
@@ -359,12 +334,7 @@ class Filter:
         for item in results_all:
             urls = item.find('a')['href'].split('&imgrefurl=')
 
-            # Skip urls that are not two-element lists
-            if len(urls) != 2:
-                continue
-
-            img_url = urlparse.unquote(urls[0].replace(
-                f'/{Endpoint.imgres}?imgurl=', ''))
+            img_url = urlparse.unquote(urls[0].replace('/imgres?imgurl=', ''))
 
             try:
                 # Try to strip out only the necessary part of the web page link
