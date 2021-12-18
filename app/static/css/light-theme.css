@@ -125,12 +125,8 @@ input {
     color: var(--whoogle-contrast-text);
 }
 
-.link {
+#gh-link {
     color: var(--whoogle-element-bg);
-}
-
-.link-color {
-    color: var(--whoogle-result-url) !important;
 }
 
 .autocomplete-items {
@@ -177,12 +173,4 @@ path {
     background-color: var(--whoogle-result-bg) !important;
     color: var(--whoogle-text);
     border-bottom: 0px;
-}
-
-.ip-text-div, .update_available, .cb_label, .cb {
-  color: var(--whoogle-secondary-text) !important;
-}
-
-.cb:focus {
-  color: var(--whoogle-text) !important;
 }
