@@ -1,12 +1,12 @@
 import os
-import re
 from typing import Any
 
-from app.filter import Filter, get_first_link
-from app.request import gen_query
 from bs4 import BeautifulSoup as bsoup
 from cryptography.fernet import Fernet, InvalidToken
 from flask import g
+
+from app.filter import Filter, get_first_link
+from app.request import gen_query
 
 TOR_BANNER = '<hr><h1 style="text-align: center">You are using Tor</h1><hr>'
 CAPTCHA = 'div class="g-recaptcha"'
@@ -52,15 +52,15 @@ class Search:
     Attributes:
         request: the incoming flask request
         config: the current user config settings
-        session_key: the flask user fernet key
+        session: the flask user session
     """
-    def __init__(self, request, config, session_key, cookies_disabled=False):
+    def __init__(self, request, config, session, cookies_disabled=False):
         method = request.method
         self.request_params = request.args if method == 'GET' else request.form
         self.user_agent = request.headers.get('User-Agent')
         self.feeling_lucky = False
         self.config = config
-        self.session_key = session_key
+        self.session = session
         self.query = ''
         self.cookies_disabled = cookies_disabled
         self.search_type = self.request_params.get(
@@ -95,7 +95,7 @@ class Search:
         else:
             # Attempt to decrypt if this is an internal link
             try:
-                q = Fernet(self.session_key).decrypt(q.encode()).decode()
+                q = Fernet(self.session['key']).decrypt(q.encode()).decode()
             except InvalidToken:
                 pass
 
@@ -114,12 +114,13 @@ class Search:
         """
         mobile = 'Android' in self.user_agent or 'iPhone' in self.user_agent
 
-        content_filter = Filter(self.session_key,
+        content_filter = Filter(self.session['key'],
                                 mobile=mobile,
                                 config=self.config)
         full_query = gen_query(self.query,
                                self.request_params,
-                               self.config)
+                               self.config,
+                               content_filter.near)
 
         # force mobile search when view image is true and
         # the request is not already made by a mobile
@@ -131,15 +132,17 @@ class Search:
                                        force_mobile=view_image)
 
         # Produce cleanable html soup from response
-        html_soup = bsoup(get_body.text, 'html.parser')
+        html_soup = bsoup(content_filter.reskin(get_body.text), 'html.parser')
 
         # Replace current soup if view_image is active
         if view_image:
             html_soup = content_filter.view_image(html_soup)
 
         # Indicate whether or not a Tor connection is active
+        tor_banner = bsoup('', 'html.parser')
         if g.user_request.tor_valid:
-            html_soup.insert(0, bsoup(TOR_BANNER, 'html.parser'))
+            tor_banner = bsoup(TOR_BANNER, 'html.parser')
+        html_soup.insert(0, tor_banner)
 
         if self.feeling_lucky:
             return get_first_link(html_soup)
@@ -158,14 +161,3 @@ class Search:
                 link['href'] += param_str
 
             return str(formatted_results)
-
-    def check_kw_ip(self) -> re.Match:
-        """Checks for keywords related to 'my ip' in the query
-
-        Returns:
-            bool
-
-        """
-        return re.search("([^a-z0-9]|^)my *[^a-z0-9] *(ip|internet protocol)" +
-                         "($|( *[^a-z0-9] *(((addres|address|adres|" +
-                         "adress)|a)? *$)))", self.query.lower())
